@@ -27,7 +27,7 @@ func (d Dispatcher) worker(id int) {
 
 	for job := range d.jobQueue {
 		handler, _ := d.GetHandler(job.Type)
-		fmt.Printf("worker #%d processing job #%d\n", id, job.ID)
+		fmt.Printf("worker #%d processing job #%s\n", id, job.ID)
 		handler.Process(job)
 	}
 }

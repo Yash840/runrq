@@ -1,7 +1,7 @@
 package domain
 
 type Job struct{
-	ID      int
+	ID      string
 	Type    string
 	Payload []byte
 }

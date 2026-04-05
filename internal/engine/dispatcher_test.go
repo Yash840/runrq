@@ -1,8 +1,10 @@
 package engine
 
 import (
+	"fmt"
 	"testing"
 	"time"
+
 	"github.com/Yash840/runrq/internal/domain"
 )
 
@@ -22,7 +24,7 @@ func BenchmarkDispatcher(b *testing.B) {
 
 	for i := 1; i < 1001; i++ {
 		disp.Submit(domain.Job{
-			ID: i,
+			ID: fmt.Sprintf("%d", i),
 			Type: "email",
 			Payload: make([]byte, 10),
 		})
