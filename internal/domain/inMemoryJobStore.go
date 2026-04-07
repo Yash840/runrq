@@ -1,33 +1,39 @@
-package engine
+package domain
 
 import (
 	"sync"
 	"time"
-	"github.com/Yash840/runrq/internal/domain"
 )
 
 type InMemJobStore struct {
 	mu    *sync.RWMutex
-	store map[string]domain.JobRecord
+	store map[string]JobRecord
 }
 
 func NewInMemJobStore() *InMemJobStore {
 	return &InMemJobStore{
 		mu:    new(sync.RWMutex),
-		store: make(map[string]domain.JobRecord),
+		store: make(map[string]JobRecord),
 	}
 }
 
-func (js InMemJobStore) GetRecord(id string) domain.JobRecord {
+var jobStore JobStore = NewInMemJobStore()
+
+func GetJobStoreInstance() *JobStore {
+	return &jobStore
+}
+
+
+func (js InMemJobStore) GetRecord(id string) JobRecord {
 	js.mu.Lock()
 	defer js.mu.Unlock()
 	return js.store[id]
 }
 
-func (js InMemJobStore) AddNewRecord(job domain.Job) {
+func (js InMemJobStore) AddNewRecord(job Job) {
 	js.mu.Lock()
 
-	jobRecord := domain.JobRecord{
+	jobRecord := JobRecord{
 		ID:        job.ID,
 		Status:    "Pending",
 		Result:    nil,
