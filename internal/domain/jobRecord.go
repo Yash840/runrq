@@ -3,10 +3,10 @@ package domain
 import "time"
 
 type JobRecord struct {
-	ID 		    string		// same as Job ID
-	Status 	    string 	//["Pending", "Processing", "Completed", "Failed"]
-	Result 	    any
-	Error       string
-	CreatedAt   time.Time
-	CompletedAt time.Time
+	ID 		    string		`json:"id"`
+	Status 	    string 		`json:"status"`//["Pending", "Processing", "Completed", "Failed"]
+	Result 	    any			`json:"result"`
+	Error       string 		`json:"error"`
+	CreatedAt   time.Time 	`json:"created-at"`
+	CompletedAt time.Time 	`json:"completed-at"`
 }

@@ -1,21 +1,36 @@
 package domain
 
-import "errors"
+import (
+	"errors"
+	"time"
+)
 
-type DefaultRegistry struct{
-	Registry map[string]JobHandler
+type DefaultRegistry struct {
+	Registry map[string]JobProcessor
 }
 
-func (dr DefaultRegistry) GetHandler(Type string) (JobHandler, error) {
+var EmailHandler JobProcessor = JobProcessor{Processor: EmailProcessor, JobStore: *GetJobStoreInstance()}
+
+func EmailProcessor(job Job) (any, error) {
+	time.Sleep(10 * time.Second)
+	return nil, nil
+}
+
+func NewDefaultRegistry() *DefaultRegistry {
+	handlerMap := map[string]JobProcessor{"email": EmailHandler}
+	return &DefaultRegistry{Registry: handlerMap}
+}
+
+func (dr DefaultRegistry) GetHandler(Type string) (JobProcessor, error) {
 	handler, ok := dr.Registry[Type]
 
 	if ok == false {
-		return nil, errors.New("handler for given type is not available")
+		return handler, errors.New("handler for given type is not available")
 	}
 
 	return handler, nil
 }
 
-func (dr DefaultRegistry) AddHandler(Type string, Handler JobHandler) {
+func (dr DefaultRegistry) AddHandler(Type string, Handler JobProcessor) {
 	dr.Registry[Type] = Handler
 }
