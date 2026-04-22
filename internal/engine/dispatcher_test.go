@@ -8,7 +8,7 @@ import (
 )
 
 func BenchmarkDispatcher(b *testing.B) {
-	registry := domain.NewDefaultRegistry()
+	registry := NewDefaultRegistry()
 
 	disp := NewDispatcher(10, 100, registry)
 	disp.Start()

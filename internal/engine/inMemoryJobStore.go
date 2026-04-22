@@ -1,39 +1,42 @@
-package domain
+package engine
 
 import (
 	"sync"
 	"time"
+
+	"github.com/Yash840/runrq/internal/domain"
+	"github.com/Yash840/runrq/internal/model"
+	"github.com/Yash840/runrq/internal/repository"
 )
 
 type InMemJobStore struct {
 	mu    *sync.RWMutex
-	store map[string]JobRecord
+	store map[string]model.JobRecord
 }
 
 func NewInMemJobStore() *InMemJobStore {
 	return &InMemJobStore{
 		mu:    new(sync.RWMutex),
-		store: make(map[string]JobRecord),
+		store: make(map[string]model.JobRecord),
 	}
 }
 
-var jobStore JobStore = NewInMemJobStore()
+var jobStore repository.JobRecordsRepo = NewInMemJobStore()
 
-func GetJobStoreInstance() *JobStore {
+func GetJobStoreInstance() *repository.JobRecordsRepo {
 	return &jobStore
 }
 
-
-func (js InMemJobStore) GetRecord(id string) JobRecord {
+func (js *InMemJobStore) GetRecord(id string) model.JobRecord {
 	js.mu.Lock()
 	defer js.mu.Unlock()
 	return js.store[id]
 }
 
-func (js InMemJobStore) AddNewRecord(job Job) {
+func (js *InMemJobStore) AddNewRecord(job domain.Job) {
 	js.mu.Lock()
 
-	jobRecord := JobRecord{
+	jobRecord := model.JobRecord{
 		ID:        job.ID,
 		Status:    "Pending",
 		Result:    nil,
@@ -45,8 +48,7 @@ func (js InMemJobStore) AddNewRecord(job Job) {
 	js.mu.Unlock()
 }
 
-
-func (js InMemJobStore) MakeJobCompleted(id string, result any) {
+func (js *InMemJobStore) MakeJobCompleted(id string, result any) {
 	js.mu.Lock()
 	defer js.mu.Unlock()
 
@@ -57,7 +59,7 @@ func (js InMemJobStore) MakeJobCompleted(id string, result any) {
 	js.store[id] = jobRecord
 }
 
-func (js InMemJobStore) MakeJobProcessing(id string) {
+func (js *InMemJobStore) MakeJobProcessing(id string) {
 	js.mu.Lock()
 	defer js.mu.Unlock()
 
@@ -66,7 +68,7 @@ func (js InMemJobStore) MakeJobProcessing(id string) {
 	js.store[id] = jobRecord
 }
 
-func (js InMemJobStore) MakeJobFailed(id string, err string) {
+func (js *InMemJobStore) MakeJobFailed(id string, err string) {
 	js.mu.Lock()
 	defer js.mu.Unlock()
 

@@ -7,10 +7,11 @@ import (
 
 	"github.com/Yash840/runrq/internal/domain"
 	"github.com/Yash840/runrq/internal/engine"
+	"github.com/Yash840/runrq/internal/repository"
 	"github.com/google/uuid"
 )
 
-func HandleJobSubmission(d *engine.Dispatcher, js *domain.JobStore) http.HandlerFunc {
+func HandleJobSubmission(d *engine.Dispatcher, js *repository.JobRecordsRepo) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req domain.SubmitJobReq
 		err := json.NewDecoder(r.Body).Decode(&req)

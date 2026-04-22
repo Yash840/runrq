@@ -2,7 +2,9 @@ package engine
 
 import (
 	"fmt"
+	"log"
 	"sync"
+
 	"github.com/Yash840/runrq/internal/domain"
 )
 
@@ -46,4 +48,5 @@ func (d Dispatcher) Stop() {
 
 func (d Dispatcher) Submit(job domain.Job) {
 	d.jobQueue <- job
+	log.Printf("new job submitted with id #%v\n", job.ID)
 }

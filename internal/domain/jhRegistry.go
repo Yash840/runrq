@@ -1,6 +1,10 @@
 package domain
 
+type JobHandler interface {
+	Process(job Job)
+}
+
 type JhRegistry interface {
-	GetHandler(Type string) (JobProcessor, error)
-	AddHandler(Type string, Handler JobProcessor)
+	GetHandler(Type string) (JobHandler, error)
+	AddHandler(Type string, Handler JobHandler)
 }

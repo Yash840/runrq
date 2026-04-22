@@ -4,10 +4,10 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/Yash840/runrq/internal/domain"
+	"github.com/Yash840/runrq/internal/repository"
 )
 
-func HandleJobRetrieval(js *domain.JobStore) http.HandlerFunc {
+func HandleJobRetrieval(js *repository.JobRecordsRepo) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		jobId := r.PathValue("id")
 
