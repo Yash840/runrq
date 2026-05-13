@@ -1,67 +1,54 @@
 package shared
 
 import (
+	"encoding/json"
 	"errors"
 	"time"
 
 	"github.com/google/uuid"
 )
 
-const (
-	ACTION_GET    = "GET"
-	ACTION_POST   = "POST"
-	ACTION_DELETE = "DELETE"
-	ACTION_PATCH  = "PATCH"
-
-	STATUS_QUEUED     = "QUEUED"
-	STATUS_PROCESSING = "PROCESSING"
-	STATUS_FINISHED   = "FINISHED"
-	STATUS_FAILED     = "FAILED"
-)
-
 type Job struct {
-	JobID        string `json:"job_id"`
-	UserID       string `json:"user_id"`
-	Target       string
-	Action       string
-	Body         []byte
-	AuthType     string `json:"auth_type"`
-	authToken    string
-	JobType      string `json:"job_type"`
-	Status       string
+	JobID   string `json:"job_id"`
+	OwnerID string `json:"owner_id"`
+	JobType string `json:"job_type"`
+	Payload any
+	Status  JobStatus
+
+	//Time at which Job is intended to be executed
 	ScheduleTime time.Time `json:"schedule_time"`
-	NextRunAt    time.Time `json:"next_run_at"`
-	MaxRetries   int       `json:"max_retries"`
-	RetriesDone  int       `json:"retries_done"`
+
+	//Time at which Job will be executed next
+	NextRunAt time.Time `json:"next_run_at"`
+
+	RetryPolicy RetryPolicy
+	MaxRetries  int `json:"max_retries"`
+	RetriesDone int `json:"retries_done"`
+
+	//Boolean to tell engine, should store the result or ignore it
+	StoreResult bool `json:"store_result"`
+
+	//ID of Result associated with Job
+	ResultID string `json:"result_id"`
+
+	MaxTimeout int `json:"max_timeout"`
 }
 
 type JobOpts struct {
-	userID       string
-	target       string
-	action       string
-	body         []byte
-	authType     string
-	authToken    string
+	ownerID      string
+	payload      any
 	jobType      string
-	status       string
+	status       JobStatus
 	scheduleTime time.Time
+	RetryPolicy  RetryPolicy
 	maxRetries   int
+	StoreResult  bool
+	MaxTimeout   int
 }
 
 func NewJob(opts JobOpts) (Job, error) {
-	if opts.userID == "" {
-		return Job{}, errors.New("userID is required")
-	}
-	if opts.target == "" {
-		return Job{}, errors.New("target is required")
-	}
-
-	switch opts.action {
-	case "":
-		opts.action = ACTION_GET
-	case ACTION_GET, ACTION_POST, ACTION_DELETE, ACTION_PATCH:
-	default:
-		return Job{}, errors.New("invalid action")
+	if opts.ownerID == "" {
+		return Job{}, errors.New("ownerID is required")
 	}
 
 	if opts.scheduleTime.IsZero() {
@@ -79,18 +66,17 @@ func NewJob(opts JobOpts) (Job, error) {
 
 	return Job{
 		JobID:        jobID,
-		UserID:       opts.userID,
-		Target:       opts.target,
-		Action:       opts.action,
-		Body:         opts.body,
-		AuthType:     opts.authType,
-		authToken:    opts.authToken,
+		OwnerID:      opts.ownerID,
+		Payload:      opts.payload,
 		JobType:      opts.jobType,
-		Status:       STATUS_QUEUED,
+		Status:       JobStatusQueued,
 		ScheduleTime: opts.scheduleTime,
 		NextRunAt:    opts.scheduleTime,
+		RetryPolicy:  opts.RetryPolicy,
 		MaxRetries:   opts.maxRetries,
 		RetriesDone:  0,
+		StoreResult:  opts.StoreResult,
+		MaxTimeout:   opts.MaxTimeout,
 	}, nil
 }
 
@@ -101,4 +87,85 @@ func newJobID() (string, error) {
 	}
 
 	return b.String(), nil
+}
+
+type JobStatus int
+
+const (
+	JobStatusQueued JobStatus = iota + 1
+	JobStatusProcessing
+	JobStatusRetrying
+	JobStatusSucceed
+	JobStatusQueuedForNext
+	JobStatusFailed
+)
+
+func (j JobStatus) String() string {
+	switch j {
+	case JobStatusQueued:
+		return "Queued"
+	case JobStatusProcessing:
+		return "Processing"
+	case JobStatusRetrying:
+		return "Retrying"
+	case JobStatusSucceed:
+		return "Succeed"
+	case JobStatusQueuedForNext:
+		return "Queued-For-Next"
+	case JobStatusFailed:
+		return "Failed"
+	default:
+		return "Unknown"
+	}
+}
+
+func (j JobStatus) MarshalJSON() ([]byte, error) {
+	return json.Marshal(j.String())
+}
+
+func (j *JobStatus) UnmarshalJSON(data []byte) error {
+	var str string
+	if err := json.Unmarshal(data, &str); err != nil {
+		return err
+	}
+
+	switch str {
+	case "Queued":
+		*j = JobStatusQueued
+	case "Processing":
+		*j = JobStatusProcessing
+	case "Retrying":
+		*j = JobStatusRetrying
+	case "Succeed":
+		*j = JobStatusSucceed
+	case "Queued-For-Next":
+		*j = JobStatusQueuedForNext
+	case "Failed":
+		*j = JobStatusFailed
+	default:
+		return errors.New("invalid JobState")
+	}
+	return nil
+}
+
+type RetryPolicy int
+
+const (
+	RetryPolicyImmediate RetryPolicy = iota + 1
+	RetryPolicyModerate
+	RetryPolicyDelayed
+	RetryPolicyNone
+)
+
+func (r RetryPolicy) String() string {
+	switch r {
+	case RetryPolicyImmediate:
+		return "Immediate"
+	case RetryPolicyModerate:
+		return "Moderate"
+	case RetryPolicyDelayed:
+		return "Delayed"
+	default:
+		return "None"
+	}
 }
