@@ -30,7 +30,7 @@ type Broker interface {
 	ExtendDeadline(ctx context.Context, jobID, leaseID string, extension time.Duration) error
 
 	// ResubmitJob resubmits a job for execution after a specific duration.
-	ResubmitJob(ctx context.Context, jobID string, nextRunAfter time.Duration) error
+	ResubmitJob(ctx context.Context, jobID string, nextRunAfter time.Duration, jobJSON string) error
 
 	// PollReadyJobs transfers ready to execute jobs from main_queue to ready_queue
 	PollReadyJobs(ctx context.Context, batchSize int) error

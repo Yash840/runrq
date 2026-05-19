@@ -273,7 +273,7 @@ var resubmissionScript = redis.NewScript(`
 	redis.call('DEL', KEYS[4])
 
 	-- updating status
-	redis.call('HSET', KEYS[3], 'status', 'Retrying')
+	redis.call('HSET', KEYS[3], 'status', 'Retrying', 'job-json', ARGV[2])
 	
 	return {}
 `)
@@ -284,11 +284,11 @@ var resubmissionScript = redis.NewScript(`
 // 2. Add the job back to the main_queue with a new execution time (nextRunAt).
 // 3. Delete the job's lease.
 // 4. Update the job's status to 'Retrying'.
-func (rdb *RDB) ResubmitJob(ctx context.Context, jobID string, nextRunAfter time.Duration) error {
+func (rdb *RDB) ResubmitJob(ctx context.Context, jobID string, nextRunAfter time.Duration, jobJSON string) error {
 	now := time.Now().Unix()
 	nextRunAt := now + int64(nextRunAfter.Seconds())
 
-	err := resubmissionScript.Run(ctx, rdb.client, []string{ProcessingQueue, MainQueue, generateJobKey(jobID), generateLeaseKey(jobID)}, nextRunAt).Err()
+	err := resubmissionScript.Run(ctx, rdb.client, []string{ProcessingQueue, MainQueue, generateJobKey(jobID), generateLeaseKey(jobID)}, nextRunAt, jobJSON).Err()
 	if err != nil {
 		return fmt.Errorf("failed to resubmit job: %w", err)
 	}
