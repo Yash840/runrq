@@ -222,10 +222,75 @@ func (rdb *RDB) MarksAsCompleted(ctx context.Context, jobID, leaseID string) err
 	return nil
 }
 
+// RemoveCancelled completely removes a cancelled job's data from Redis.
+// It deletes the job's hash data using its unique job key.
 func (rdb *RDB) RemoveCancelled(ctx context.Context, jobID string) error {
 	err := rdb.client.Del(ctx, generateJobKey(jobID)).Err()
 	if err != nil {
 		return fmt.Errorf("failed to remove cancelled job: %w", err)
+	}
+
+	return nil
+}
+
+// leaseExtensionScript atomically extends the deadline of a specific job actively being processed.
+// KEYS[1]: leaseKey, KEYS[2]: ProcessingQueue
+// ARGV[1]: leaseID, ARGV[2]: extension (seconds), ARGV[3]: jobKey
+var leaseExtensionScript = redis.NewScript(`
+	local leaseID = redis.call('HGET', KEYS[1], 'lease-id')
+	if leaseID ~= ARGV[1] then
+		error("invalid lease")
+	end
+
+	redis.call('ZINCRBY', KEYS[2], ARGV[2], ARGV[3])
+	return {}
+`)
+
+// ExtendDeadline increases the deadline of a job in the processing_queue to prevent it from being recovered.
+// It uses a Lua script to atomically:
+// 1. Verify the provided lease ID matches the current lease stored in Redis.
+// 2. If valid, increment the job's score in the processing_queue by the extension duration.
+func (rdb *RDB) ExtendDeadline(ctx context.Context, jobID, leaseID string, extension time.Duration) error {
+	err := leaseExtensionScript.Run(ctx, rdb.client, []string{generateLeaseKey(jobID), ProcessingQueue}, leaseID, extension.Seconds(), generateJobKey(jobID)).Err()
+	if err != nil {
+		return fmt.Errorf("failed to extend deadline: %w", err)
+	}
+
+	return nil
+}
+
+// resubmissionScript atomically moves a job from processing back to main_queue and updates its status.
+// KEYS[1]: ProcessingQueue, KEYS[2]: MainQueue, KEYS[3]: jobKey, KEYS[4]: leaseKey
+// ARGV[1]: nextRunAt (score)
+var resubmissionScript = redis.NewScript(`
+	-- removing from Processing Queue
+	redis.call('ZREM', KEYS[1], KEYS[3])
+
+	-- adding back to Main Queue
+	redis.call('ZADD', KEYS[2], ARGV[1], KEYS[3])
+
+	-- clearing lease
+	redis.call('DEL', KEYS[4])
+
+	-- updating status
+	redis.call('HSET', KEYS[3], 'status', 'Retrying')
+	
+	return {}
+`)
+
+// ResubmitJob returns a processing job back to the main_queue to be retried later.
+// It uses a Lua script to atomically:
+// 1. Remove the job from the processing_queue.
+// 2. Add the job back to the main_queue with a new execution time (nextRunAt).
+// 3. Delete the job's lease.
+// 4. Update the job's status to 'Retrying'.
+func (rdb *RDB) ResubmitJob(ctx context.Context, jobID string, nextRunAfter time.Duration) error {
+	now := time.Now().Unix()
+	nextRunAt := now + int64(nextRunAfter.Seconds())
+
+	err := resubmissionScript.Run(ctx, rdb.client, []string{ProcessingQueue, MainQueue, generateJobKey(jobID), generateLeaseKey(jobID)}, nextRunAt).Err()
+	if err != nil {
+		return fmt.Errorf("failed to resubmit job: %w", err)
 	}
 
 	return nil
@@ -236,6 +301,10 @@ func (rdb *RDB) RemoveCancelled(ctx context.Context, jobID string) error {
 // ARGV[1]: currentTime, ARGV[2]: batchSize
 var transferScript = redis.NewScript(`
 	local jobs = redis.call('ZRANGE', KEYS[1], '-inf', ARGV[1], 'BYSCORE', 'LIMIT', 0, ARGV[2])
+	if #jobs == 0 then
+		return error("no jobs to poll")
+	end
+
 	if #jobs > 0 then 
 		redis.call('ZREM', KEYS[1], unpack(jobs))
 		redis.call('LPUSH', KEYS[2], unpack(jobs))
@@ -261,15 +330,14 @@ func (rdb *RDB) PollReadyJobs(ctx context.Context, batchSize int) error {
 	return nil
 }
 
-// recoveryScript atomically requeues abandoned jobs back into main_queue with random backoff.
+// recoverScript atomically requeues abandoned jobs back into main_queue with random backoff.
 // KEYS[1]: ProcessingQueue, KEYS[2]: MainQueue
 // ARGV[1]: currentTime, ARGV[2]: batchSize, ARGV[3]: maxRecoveryBackoff (seconds)
-var recoveryScript = redis.NewScript(`
+var recoverScript = redis.NewScript(`
 	local jobs = redis.call('ZRANGE', KEYS[1], '-inf', ARGV[1], 'BYSCORE', 'LIMIT', 0, ARGV[2])
 	if #jobs > 0 then
 		for i, jobKey in ipairs(jobs) do
 			local jobStatus = redis.call('HGET', jobKey, 'status')
-				
 
 			local newScore = ARGV[1] + math.random(ARGV[3])
 			redis.call('ZREM', KEYS[1], jobKey)
@@ -298,7 +366,7 @@ var recoveryScript = redis.NewScript(`
 func (rdb *RDB) RecoverAbandonedJobs(ctx context.Context, batchSize int) error {
 	now := time.Now().Unix()
 
-	err := recoveryScript.Run(ctx, rdb.client, []string{ProcessingQueue, MainQueue}, now, batchSize, MaxRecoveryBackoff.Seconds()).Err()
+	err := recoverScript.Run(ctx, rdb.client, []string{ProcessingQueue, MainQueue}, now, batchSize, MaxRecoveryBackoff.Seconds()).Err()
 	if err != nil {
 		return fmt.Errorf("failed to recover jobs : %w", err)
 	}
@@ -306,14 +374,17 @@ func (rdb *RDB) RecoverAbandonedJobs(ctx context.Context, batchSize int) error {
 	return nil
 }
 
+// generateJobKey creates a unique Redis key for a job's hash data based on its ID.
 func generateJobKey(ID string) string {
 	return "job:" + ID
 }
 
+// generateLeaseKey creates a unique Redis key for a job's lease data based on its ID.
 func generateLeaseKey(ID string) string {
 	return "lease:job:" + ID
 }
 
+// generateLeaseID generates a new UUID v7 to be used as a unique lease identifier.
 func generateLeaseID() (string, error) {
 	b, err := uuid.NewV7()
 	if err != nil {
