@@ -2,7 +2,6 @@ package rdb
 
 import (
 	"context"
-	"encoding/json"
 	"log"
 	"os"
 	"slices"
@@ -182,17 +181,25 @@ func TestRDB_Acquire(t *testing.T) {
 			MaxTimeout:   60,
 		}
 
-		jobJSON, err := json.Marshal(dummyJob)
-		if err != nil {
-			t.Fatalf("Failed to marshal dummy job to JSON: %v", err)
-		}
+		mr.HSet(generateJobKey(dummyJobID),
+			"job_id", dummyJobID,
+			"owner_id", dummyJob.OwnerID,
+			"job_type", dummyJob.JobType,
+			"payload", `{"to":"test@example.com"}`,
+			"status", "Queued",
+			"schedule_time", dummyJob.ScheduleTime.Format(time.RFC3339),
+			"next_run_at", dummyJob.NextRunAt.Format(time.RFC3339),
+			"retry_policy", dummyJob.RetryPolicy.String(),
+			"max_retries", "3",
+			"retries_done", "0",
+			"store_result", "true",
+			"max_timeout", "60",
+		)
 
-		_, err = mr.Lpush(ReadyQueue, generateJobKey(dummyJobID))
+		_, err := mr.Lpush(ReadyQueue, generateJobKey(dummyJobID))
 		if err != nil {
 			t.Fatalf("Miniredis command failed: %v", err)
 		}
-
-		mr.HSet(generateJobKey(dummyJobID), "status", "Queued", "job-json", string(jobJSON))
 
 		var leaseId string
 		var job *shared.Job
@@ -207,7 +214,7 @@ func TestRDB_Acquire(t *testing.T) {
 		jobStatus := mr.HGet(generateJobKey(dummyJobID), "status")
 		assert.Equal(t, jobStatus, shared.JobStatusProcessing.String(), "The job status must be transitioned to 'Processing' upon acquisition")
 
-		isLeaseAdded := mr.Exists(generateLeaseKey(dummyJobID))
+		isLeaseAdded := mr.HGet(generateJobKey(dummyJobID), "lease_id") != ""
 		assert.True(t, isLeaseAdded, "A lease record must be created for the acquired job")
 	})
 }
@@ -222,8 +229,7 @@ func TestRDB_MarksAsCompleted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Miniredis command failed: %v", err)
 	}
-	mr.HSet(generateJobKey(jobId), "status", "Processing")
-	mr.HSet(generateLeaseKey(jobId), "lease-id", leaseID)
+	mr.HSet(generateJobKey(jobId), "status", "Processing", "lease_id", leaseID)
 
 	var pq []string
 
@@ -242,8 +248,8 @@ func TestRDB_MarksAsCompleted(t *testing.T) {
 		isThereJobHash := mr.Exists(generateJobKey(jobId))
 		assert.True(t, isThereJobHash, "The job hash must not be modified when completion is attempted with an invalid lease")
 
-		isThereLeaseHash := mr.Exists(generateLeaseKey(jobId))
-		assert.True(t, isThereLeaseHash, "The job lease must not be modified when completion is attempted with an invalid lease")
+		isThereLeaseField := mr.HGet(generateJobKey(jobId), "lease_id") != ""
+		assert.True(t, isThereLeaseField, "The job lease must not be modified when completion is attempted with an invalid lease")
 	})
 
 	t.Run("attempting to mark job completed with correct lease", func(t *testing.T) {
@@ -265,8 +271,6 @@ func TestRDB_MarksAsCompleted(t *testing.T) {
 		isThereJobHash := mr.Exists(generateJobKey(jobId))
 		assert.False(t, isThereJobHash, "The job hash must be deleted upon successful completion")
 
-		isThereLeaseHash := mr.Exists(generateLeaseKey(jobId))
-		assert.False(t, isThereLeaseHash, "The lease hash must be deleted upon successful completion")
 	})
 }
 
@@ -328,7 +332,7 @@ func TestRDB_ExtendDeadline(t *testing.T) {
 
 	now := time.Now().Unix()
 
-	mr.HSet(generateLeaseKey(jobId), "lease-id", leaseID)
+	mr.HSet(generateJobKey(jobId), "lease_id", leaseID)
 	_, err := mr.ZAdd(ProcessingQueue, float64(now), generateJobKey(jobId))
 	if err != nil {
 		t.Fatalf("Miniredis command failed: %v", err)
@@ -358,7 +362,6 @@ func TestRDB_ResubmitJob(t *testing.T) {
 
 	jobID := uuid.New().String()
 	jobKey := generateJobKey(jobID)
-	leaseKey := generateLeaseKey(jobID)
 
 	now := time.Now().Unix()
 
@@ -367,11 +370,14 @@ func TestRDB_ResubmitJob(t *testing.T) {
 		t.Fatalf("Miniredis command failed: %v", err)
 	}
 
-	mr.HSet(jobKey, "status", "Processing")
-	mr.HSet(leaseKey, "lease-id", "some-lease-id")
+	mr.HSet(jobKey, "status", "Processing", "lease_id", "some-lease-id")
 
 	nextRunAfter := 5 * time.Minute
-	err = rdb.ResubmitJob(ctx, jobID, nextRunAfter)
+	err = rdb.ResubmitJob(ctx, jobID, nextRunAfter, &shared.Job{
+		JobID:       jobID,
+		RetriesDone: 1,
+		NextRunAt:   time.Unix(now+int64(nextRunAfter.Seconds()), 0),
+	})
 	assert.NoError(t, err, "No error should be returned when resubmitting a job")
 
 	pq, _ := mr.ZMembers(ProcessingQueue)
@@ -382,11 +388,11 @@ func TestRDB_ResubmitJob(t *testing.T) {
 	isJobInMq := slices.Contains(mq, jobKey)
 	assert.True(t, isJobInMq, "The job must be added back to the main queue")
 
-	isLeaseExist := mr.Exists(leaseKey)
-	assert.False(t, isLeaseExist, "The lease must be cleared")
-
 	status := mr.HGet(jobKey, "status")
 	assert.Equal(t, status, "Retrying", "The job status must be updated to 'Retrying'")
+
+	isLeaseExist := mr.HGet(jobKey, "lease_id") != ""
+	assert.False(t, isLeaseExist, "The lease must be cleared")
 
 	score, err := mr.ZScore(MainQueue, jobKey)
 	if err != nil {

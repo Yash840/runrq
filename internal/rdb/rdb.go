@@ -39,7 +39,8 @@ Cancellation is handled by updating the 'status' field of this hash to 'Cancelle
 It is stored as:
   - hash key: jobKey
   - field 'status': current status of the job
-  - field 'job-json': JSON blob containing the job body
+  - field 'lease_id': unique ID for job ownership during processing
+  - field '...': other job details as separate fields
 */
 
 const (
@@ -59,29 +60,43 @@ type RDB struct {
 	client *redis.Client
 }
 
+func NewRDB(client *redis.Client) *RDB {
+	return &RDB{client: client}
+}
+
 // submitScript atomically adds a job to the main_queue and sets its hash data.
 // KEYS[1]: MainQueue, KEYS[2]: jobKey
-// ARGV[1]: nextRunAt (score), ARGV[2]: jobJSON
+// ARGV: score, job fields (key, value, key, value, ...)
 var submitScript = redis.NewScript(`
 	redis.call('ZADD', KEYS[1], ARGV[1], KEYS[2])
-	redis.call('HSET', KEYS[2], 'status', 'Queued', 'job-json', ARGV[2])
+	redis.call('HSET', KEYS[2], unpack(ARGV, 2))
 	return 1
 `)
 
 // Submit adds a new job to the main_queue and sets its initial data.
-// It uses a Lua script to atomically:
-// 1. Add the job key to the main_queue ZSET with its execution time (nextRunAt) as the score.
-// 2. Set the job's initial status to 'Queued' and store its JSON payload in a HASH.
 func (rdb *RDB) Submit(ctx context.Context, job *shared.Job) error {
 	nextRunAt := job.NextRunAt.Unix()
-
-	jobJSON, err := json.Marshal(job)
 	jobKey := generateJobKey(job.JobID)
+
+	payloadJSON, err := json.Marshal(job.Payload)
 	if err != nil {
-		return fmt.Errorf("failed to submit job : %w", err)
+		return fmt.Errorf("failed to marshal payload: %w", err)
 	}
 
-	err = submitScript.Run(ctx, rdb.client, []string{MainQueue, jobKey}, nextRunAt, jobJSON).Err()
+	err = submitScript.Run(ctx, rdb.client, []string{MainQueue, jobKey}, nextRunAt,
+		"job_id", job.JobID,
+		"owner_id", job.OwnerID,
+		"job_type", job.JobType,
+		"payload", string(payloadJSON),
+		"status", job.Status.String(),
+		"schedule_time", job.ScheduleTime.Format(time.RFC3339),
+		"next_run_at", job.NextRunAt.Format(time.RFC3339),
+		"retry_policy", job.RetryPolicy.String(),
+		"max_retries", job.MaxRetries,
+		"retries_done", job.RetriesDone,
+		"store_result", job.StoreResult,
+		"max_timeout", job.MaxTimeout,
+	).Err()
 	if err != nil {
 		return fmt.Errorf("failed to submit job : %w", err)
 	}
@@ -91,7 +106,6 @@ func (rdb *RDB) Submit(ctx context.Context, job *shared.Job) error {
 
 // cancelScript atomically tries to remove a job from queues or marks it as cancelled.
 // KEYS[1]: MainQueue, KEYS[2]: ReadyQueue, KEYS[3]: jobKey
-// ARGV: (none)
 var cancelScript = redis.NewScript(`
 	local removed = redis.call('ZREM', KEYS[1], KEYS[3])
 	if removed > 0 then
@@ -109,32 +123,22 @@ var cancelScript = redis.NewScript(`
 	return {}
 `)
 
-// Cancel attempts to remove a job from the queues or marks it as cancelled.
-// It uses a Lua script to atomically:
-// 1. Try removing the job from the main_queue. If successful, delete the job data.
-// 2. Try removing the job from the ready_queue. If successful, delete the job data.
-// 3. If the job is in neither queue (likely processing), update its status in the job hash to 'Cancelled' for workers to double-check.
 func (rdb *RDB) Cancel(ctx context.Context, jobID string) error {
 	jobKey := generateJobKey(jobID)
 	err := cancelScript.Run(ctx, rdb.client, []string{MainQueue, ReadyQueue, jobKey}).Err()
 	if err != nil {
 		return fmt.Errorf("failed to cancel job : %w", err)
 	}
-
 	return nil
 }
 
-// IsCancelled checks if a given jobID has been marked as cancelled.
-// It fetches the job hash and checks if the 'status' field is 'Cancelled'.
 func (rdb *RDB) IsCancelled(ctx context.Context, jobID string) (bool, error) {
 	jobKey := generateJobKey(jobID)
 	jobStatus, err := rdb.client.HGet(ctx, jobKey, "status").Result()
 	if err != nil {
 		return false, fmt.Errorf("failed to fetch job : %w", err)
 	}
-
-	isCancelled := jobStatus == "Cancelled"
-	return isCancelled, nil
+	return jobStatus == "Cancelled", nil
 }
 
 // acquisitionScript atomically acquires a job, moves it to processing, sets status and lease.
@@ -143,25 +147,15 @@ func (rdb *RDB) IsCancelled(ctx context.Context, jobID string) (bool, error) {
 var acquisitionScript = redis.NewScript(`
 	local jobKey = redis.call('RPOP', KEYS[1])
 	if jobKey == nil then
-		return ''
+		return nil
 	end
 
 	local deadline = ARGV[1] + ARGV[2]
 	redis.call('ZADD', KEYS[2], deadline, jobKey)
-	redis.call('HSET', jobKey, 'status', 'Processing')
-	local job = redis.call('HGET', jobKey, 'job-json')
-	local leaseKey = 'lease:'..jobKey
-	redis.call('HSET', leaseKey, 'lease-id', ARGV[3])
-	return job
+	redis.call('HSET', jobKey, 'status', 'Processing', 'lease_id', ARGV[3])
+	return jobKey
 `)
 
-// Acquire fetches a job from the ready_queue for processing.
-// It uses a Lua script to atomically:
-// 1. Pop a job from the right side of the ready_queue.
-// 2. Add the job to the processing_queue with a deadline score (current time + timeout).
-// 3. Update the job's status to 'Processing'.
-// 4. Generate and store a lease ID for the job to track ownership.
-// 5. Return the job's JSON payload.
 func (rdb *RDB) Acquire(ctx context.Context) (*shared.Job, string, error) {
 	leaseID, err := generateLeaseID()
 	if err != nil {
@@ -174,174 +168,142 @@ func (rdb *RDB) Acquire(ctx context.Context) (*shared.Job, string, error) {
 		return nil, "", fmt.Errorf("failed to fetch job : %w", err)
 	}
 
-	if res == "" {
+	if res == nil {
 		return nil, "", ErrNoJobsToAcquire
 	}
 
-	jobJSON, ok := res.(string)
+	jobKey := res.(string)
 
-	if !ok || jobJSON == "" {
-		return nil, "", errors.New("no jobs to acquire")
+	type JobScan struct {
+		shared.Job
+		Payload string `redis:"payload"`
+		JobID   string `redis:"job_id"`
+	}
+	var js JobScan
+	err = rdb.client.HGetAll(ctx, jobKey).Scan(&js)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to scan job: %w", err)
 	}
 
-	var job shared.Job
-	err = json.Unmarshal([]byte(jobJSON), &job)
-	if err != nil {
-		return nil, "", fmt.Errorf("failed to unmarshal job json: %w", err)
+	job := js.Job
+	job.JobID = js.JobID
+	if js.Payload != "" {
+		var p any
+		if err := json.Unmarshal([]byte(js.Payload), &p); err == nil {
+			job.Payload = p
+		}
 	}
 
 	return &job, leaseID, nil
 }
 
 // completionScript atomically verifies lease, removes job from processing, and cleans up data.
-// KEYS[1]: leaseKey, KEYS[2]: ProcessingQueue
-// ARGV[1]: leaseID, ARGV[2]: jobKey
+// KEYS[1]: jobKey, KEYS[2]: ProcessingQueue
+// ARGV[1]: leaseID
 var completionScript = redis.NewScript(`
-	local currentLease = redis.call('HGET', KEYS[1], 'lease-id')
+	local currentLease = redis.call('HGET', KEYS[1], 'lease_id')
 	if currentLease ~= ARGV[1] then
 		error('lease expired')
 	end
 
-	redis.call('ZREM', KEYS[2], ARGV[2])
-	redis.call('DEL', ARGV[2])
+	redis.call('ZREM', KEYS[2], KEYS[1])
 	redis.call('DEL', KEYS[1])
 	return 1
 `)
 
-// MarksAsCompleted removes a finished job from the processing_queue and deletes its data.
-// It uses a Lua script to atomically:
-// 1. Verify the provided lease ID matches the current lease stored in Redis.
-// 2. If valid, remove the job from the processing_queue.
-// 3. Delete the job data and its lease.
 func (rdb *RDB) MarksAsCompleted(ctx context.Context, jobID, leaseID string) error {
-	err := completionScript.Run(ctx, rdb.client, []string{generateLeaseKey(jobID), ProcessingQueue}, leaseID, generateJobKey(jobID)).Err()
+	err := completionScript.Run(ctx, rdb.client, []string{generateJobKey(jobID), ProcessingQueue}, leaseID).Err()
 	if err != nil {
 		return fmt.Errorf("failed to mark job succeed: %w", err)
 	}
-
 	return nil
 }
 
-// RemoveCancelled completely removes a cancelled job's data from Redis.
-// It deletes the job's hash data using its unique job key.
 func (rdb *RDB) RemoveCancelled(ctx context.Context, jobID string) error {
 	err := rdb.client.Del(ctx, generateJobKey(jobID)).Err()
 	if err != nil {
 		return fmt.Errorf("failed to remove cancelled job: %w", err)
 	}
-
 	return nil
 }
 
 // leaseExtensionScript atomically extends the deadline of a specific job actively being processed.
-// KEYS[1]: leaseKey, KEYS[2]: ProcessingQueue
-// ARGV[1]: leaseID, ARGV[2]: extension (seconds), ARGV[3]: jobKey
+// KEYS[1]: jobKey, KEYS[2]: ProcessingQueue
+// ARGV[1]: leaseID, ARGV[2]: extension (seconds)
 var leaseExtensionScript = redis.NewScript(`
-	local leaseID = redis.call('HGET', KEYS[1], 'lease-id')
+	local leaseID = redis.call('HGET', KEYS[1], 'lease_id')
 	if leaseID ~= ARGV[1] then
 		error("invalid lease")
 	end
 
-	redis.call('ZINCRBY', KEYS[2], ARGV[2], ARGV[3])
+	redis.call('ZINCRBY', KEYS[2], ARGV[2], KEYS[1])
 	return {}
 `)
 
-// ExtendDeadline increases the deadline of a job in the processing_queue to prevent it from being recovered.
-// It uses a Lua script to atomically:
-// 1. Verify the provided lease ID matches the current lease stored in Redis.
-// 2. If valid, increment the job's score in the processing_queue by the extension duration.
 func (rdb *RDB) ExtendDeadline(ctx context.Context, jobID, leaseID string, extension time.Duration) error {
-	err := leaseExtensionScript.Run(ctx, rdb.client, []string{generateLeaseKey(jobID), ProcessingQueue}, leaseID, extension.Seconds(), generateJobKey(jobID)).Err()
+	err := leaseExtensionScript.Run(ctx, rdb.client, []string{generateJobKey(jobID), ProcessingQueue}, leaseID, extension.Seconds()).Err()
 	if err != nil {
 		return fmt.Errorf("failed to extend deadline: %w", err)
 	}
-
 	return nil
 }
 
 // resubmissionScript atomically moves a job from processing back to main_queue and updates its status.
-// KEYS[1]: ProcessingQueue, KEYS[2]: MainQueue, KEYS[3]: jobKey, KEYS[4]: leaseKey
-// ARGV[1]: nextRunAt (score)
+// KEYS[1]: ProcessingQueue, KEYS[2]: MainQueue, KEYS[3]: jobKey
+// ARGV[1]: nextRunAt (score), ARGV[2...]: fields
 var resubmissionScript = redis.NewScript(`
-	-- removing from Processing Queue
 	redis.call('ZREM', KEYS[1], KEYS[3])
-
-	-- adding back to Main Queue
 	redis.call('ZADD', KEYS[2], ARGV[1], KEYS[3])
-
-	-- clearing lease
-	redis.call('DEL', KEYS[4])
-
-	-- updating status
-	redis.call('HSET', KEYS[3], 'status', 'Retrying', 'job-json', ARGV[2])
-	
+	redis.call('HDEL', KEYS[3], 'lease_id')
+	redis.call('HSET', KEYS[3], unpack(ARGV, 2))
 	return {}
 `)
 
-// ResubmitJob returns a processing job back to the main_queue to be retried later.
-// It uses a Lua script to atomically:
-// 1. Remove the job from the processing_queue.
-// 2. Add the job back to the main_queue with a new execution time (nextRunAt).
-// 3. Delete the job's lease.
-// 4. Update the job's status to 'Retrying'.
-func (rdb *RDB) ResubmitJob(ctx context.Context, jobID string, nextRunAfter time.Duration, jobJSON string) error {
+func (rdb *RDB) ResubmitJob(ctx context.Context, jobID string, nextRunAfter time.Duration, job *shared.Job) error {
 	now := time.Now().Unix()
 	nextRunAt := now + int64(nextRunAfter.Seconds())
+	jobKey := generateJobKey(jobID)
 
-	err := resubmissionScript.Run(ctx, rdb.client, []string{ProcessingQueue, MainQueue, generateJobKey(jobID), generateLeaseKey(jobID)}, nextRunAt, jobJSON).Err()
+	err := resubmissionScript.Run(ctx, rdb.client, []string{ProcessingQueue, MainQueue, jobKey}, nextRunAt,
+		"status", "Retrying",
+		"retries_done", job.RetriesDone,
+		"next_run_at", job.NextRunAt.Format(time.RFC3339),
+	).Err()
 	if err != nil {
 		return fmt.Errorf("failed to resubmit job: %w", err)
 	}
-
 	return nil
 }
 
 // transferScript atomically moves ready jobs from main_queue to ready_queue.
-// KEYS[1]: MainQueue, KEYS[2]: ReadyQueue
-// ARGV[1]: currentTime, ARGV[2]: batchSize
 var transferScript = redis.NewScript(`
 	local jobs = redis.call('ZRANGE', KEYS[1], '-inf', ARGV[1], 'BYSCORE', 'LIMIT', 0, ARGV[2])
-	if #jobs == 0 then
-		return error("no jobs to poll")
-	end
-
 	if #jobs > 0 then 
 		redis.call('ZREM', KEYS[1], unpack(jobs))
 		redis.call('LPUSH', KEYS[2], unpack(jobs))
-
 		return jobs
 	end
-
 	return {}
-	`)
+`)
 
-// PollReadyJobs moves jobs that are ready to execute from the main_queue to the ready_queue.
-// It uses a Lua script to atomically:
-// 1. Fetch up to 'batchSize' jobs from the main_queue whose scores (nextRunAt) are less than or equal to the current time.
-// 2. Remove these jobs from the main_queue.
-// 3. Push these jobs onto the left side of the ready_queue list.
 func (rdb *RDB) PollReadyJobs(ctx context.Context, batchSize int) error {
 	now := time.Now().Unix()
 	err := transferScript.Run(ctx, rdb.client, []string{MainQueue, ReadyQueue}, now, batchSize).Err()
-	if err != nil {
+	if err != nil && err.Error() != "redis: nil" {
 		return fmt.Errorf("failed to poll jobs : %w", err)
 	}
-
 	return nil
 }
 
 // recoverScript atomically requeues abandoned jobs back into main_queue with random backoff.
-// KEYS[1]: ProcessingQueue, KEYS[2]: MainQueue
-// ARGV[1]: currentTime, ARGV[2]: batchSize, ARGV[3]: maxRecoveryBackoff (seconds)
 var recoverScript = redis.NewScript(`
 	local jobs = redis.call('ZRANGE', KEYS[1], '-inf', ARGV[1], 'BYSCORE', 'LIMIT', 0, ARGV[2])
 	if #jobs > 0 then
 		for i, jobKey in ipairs(jobs) do
 			local jobStatus = redis.call('HGET', jobKey, 'status')
-
 			local newScore = ARGV[1] + math.random(ARGV[3])
 			redis.call('ZREM', KEYS[1], jobKey)
-			redis.call('DEL', 'lease:' .. jobKey)
+			redis.call('HDEL', jobKey, 'lease_id')
 
 			if jobStatus ~= 'Cancelled' then
 				redis.call('ZADD', KEYS[2], newScore, jobKey)
@@ -351,45 +313,26 @@ var recoverScript = redis.NewScript(`
 			end		
 		end
 	end
-
 	return {}
 `)
 
-// RecoverAbandonedJobs re-queues jobs that have exceeded their processing deadline.
-// It uses a Lua script to atomically:
-//  1. Fetch up to 'batchSize' jobs from the processing_queue whose deadline scores are less than or equal to the current time.
-//  2. For each abandoned job:
-//     a. Fetch its status from the job hash.
-//     b. Remove it from the processing_queue and delete its expired lease.
-//     c. If it wasn't cancelled, add it back to the main_queue with a new score (random backoff) and update status to 'Recovering'.
-//     d. If it was cancelled, delete the job hash entirely.
 func (rdb *RDB) RecoverAbandonedJobs(ctx context.Context, batchSize int) error {
 	now := time.Now().Unix()
-
 	err := recoverScript.Run(ctx, rdb.client, []string{ProcessingQueue, MainQueue}, now, batchSize, MaxRecoveryBackoff.Seconds()).Err()
 	if err != nil {
 		return fmt.Errorf("failed to recover jobs : %w", err)
 	}
-
 	return nil
 }
 
-// generateJobKey creates a unique Redis key for a job's hash data based on its ID.
 func generateJobKey(ID string) string {
 	return "job:" + ID
 }
 
-// generateLeaseKey creates a unique Redis key for a job's lease data based on its ID.
-func generateLeaseKey(ID string) string {
-	return "lease:job:" + ID
-}
-
-// generateLeaseID generates a new UUID v7 to be used as a unique lease identifier.
 func generateLeaseID() (string, error) {
 	b, err := uuid.NewV7()
 	if err != nil {
 		return "", err
 	}
-
 	return b.String(), nil
 }

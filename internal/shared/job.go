@@ -9,29 +9,26 @@ import (
 )
 
 type Job struct {
-	JobID   string `json:"job_id"`
-	OwnerID string `json:"owner_id"`
-	JobType string `json:"job_type"`
-	Payload any
-	Status  JobStatus
+	JobID   string    `json:"job_id" redis:"job_id"`
+	OwnerID string    `json:"owner_id" redis:"owner_id"`
+	JobType string    `json:"job_type" redis:"job_type"`
+	Payload any       `json:"payload" redis:"payload"`
+	Status  JobStatus `json:"status" redis:"status"`
 
 	//Time at which Job is intended to be executed
-	ScheduleTime time.Time `json:"schedule_time"`
+	ScheduleTime time.Time `json:"schedule_time" redis:"schedule_time"`
 
 	//Time at which Job will be executed next
-	NextRunAt time.Time `json:"next_run_at"`
+	NextRunAt time.Time `json:"next_run_at" redis:"next_run_at"`
 
-	RetryPolicy RetryPolicy
-	MaxRetries  int `json:"max_retries"`
-	RetriesDone int `json:"retries_done"`
+	RetryPolicy RetryPolicy `json:"retry_policy" redis:"retry_policy"`
+	MaxRetries  int         `json:"max_retries" redis:"max_retries"`
+	RetriesDone int         `json:"retries_done" redis:"retries_done"`
 
 	//Boolean to tell engine, should store the result or ignore it
-	StoreResult bool `json:"store_result"`
+	StoreResult bool `json:"store_result" redis:"store_result"`
 
-	//ID of Result associated with Job
-	ResultID string `json:"result_id"`
-
-	MaxTimeout int `json:"max_timeout"`
+	MaxTimeout int `json:"max_timeout" redis:"max_timeout"`
 }
 
 type JobOpts struct {
@@ -148,6 +145,31 @@ func (j *JobStatus) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+func (j JobStatus) MarshalBinary() ([]byte, error) {
+	return []byte(j.String()), nil
+}
+
+func (j *JobStatus) UnmarshalBinary(data []byte) error {
+	str := string(data)
+	switch str {
+	case "Queued":
+		*j = JobStatusQueued
+	case "Processing":
+		*j = JobStatusProcessing
+	case "Retrying":
+		*j = JobStatusRetrying
+	case "Succeed":
+		*j = JobStatusSucceed
+	case "Queued-For-Next":
+		*j = JobStatusQueuedForNext
+	case "Failed":
+		*j = JobStatusFailed
+	default:
+		return errors.New("invalid JobState")
+	}
+	return nil
+}
+
 type RetryPolicy int
 
 const (
@@ -168,4 +190,25 @@ func (r RetryPolicy) String() string {
 	default:
 		return "None"
 	}
+}
+
+func (r RetryPolicy) MarshalBinary() ([]byte, error) {
+	return []byte(r.String()), nil
+}
+
+func (r *RetryPolicy) UnmarshalBinary(data []byte) error {
+	str := string(data)
+	switch str {
+	case "Immediate":
+		*r = RetryPolicyImmediate
+	case "Moderate":
+		*r = RetryPolicyModerate
+	case "Delayed":
+		*r = RetryPolicyDelayed
+	case "None":
+		*r = RetryPolicyNone
+	default:
+		return errors.New("invalid RetryPolicy")
+	}
+	return nil
 }
