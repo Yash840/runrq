@@ -20,6 +20,9 @@ type Broker interface {
 	// MarksAsCompleted flags a job as successfully finished, using the job ID and its corresponding lease ID.
 	MarksAsCompleted(ctx context.Context, jobID, leaseID string) error
 
+	// MarkAsFailed moves a job to the failed queue and updates its status to failed.
+	MarkAsFailed(ctx context.Context, jobID, leaseID string) error
+
 	// IsCancelled checks whether a particular job has been marked as cancelled.
 	IsCancelled(ctx context.Context, jobID string) (bool, error)
 
@@ -30,7 +33,7 @@ type Broker interface {
 	ExtendDeadline(ctx context.Context, jobID, leaseID string, extension time.Duration) error
 
 	// ResubmitJob resubmits a job for execution after a specific duration.
-	ResubmitJob(ctx context.Context, jobID string, nextRunAfter time.Duration, job *Job) error
+	ResubmitJob(ctx context.Context, nextRunAfter time.Duration, job *Job) error
 
 	// PollReadyJobs transfers ready to execute jobs from main_queue to ready_queue
 	PollReadyJobs(ctx context.Context, batchSize int) error

@@ -15,16 +15,17 @@ func NewResultRepository(db *sql.DB) *ResultRepository {
 	return &ResultRepository{db: db}
 }
 
-func (r ResultRepository) Create(jobID string, body any) error {
+func (r ResultRepository) Create(jobID string, body any, finishTime time.Time) error {
 	query := `
-		INSERT INTO results(job_id, body) 
-		VALUES ($1, $2)                                                           	
+		INSERT INTO results(job_id, body, finish_time) 
+		VALUES ($1, $2, $3)                                                           	
 	`
 
 	return r.db.QueryRow(
 		query,
 		jobID,
 		body,
+		finishTime,
 	).Err()
 }
 

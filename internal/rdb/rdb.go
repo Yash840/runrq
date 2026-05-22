@@ -3,7 +3,6 @@ package rdb
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"time"
 
@@ -33,6 +32,12 @@ In Runrq v1, there are four primary queues for storing and managing jobs:
      - score: deadline (computed during job acquisition and can be extended by the worker via heartbeating)
      - member: jobKey
 
+4. failed_queue: When a job fails (e.g. exhausts all retries), it is moved to this queue for tracking.
+   This queue is a Redis ZSET, storing jobs as:
+     - key: 'failed_queue'
+     - score: failure timestamp
+     - member: jobKey
+
 While these queues primarily manage the jobKeys, the actual job data is stored as a Redis HASH using the jobKey as the identifier.
 Cancellation is handled by updating the 'status' field of this hash to 'Cancelled' instead of maintaining a separate Set.
 
@@ -47,12 +52,11 @@ const (
 	MainQueue       = "main_queue"
 	ReadyQueue      = "ready_queue"
 	ProcessingQueue = "processing_queue"
+	FailedQueue     = "failed_queue"
 
-	DefaultJobTimeout  = 30 * time.Second
-	MaxRecoveryBackoff = 30 * time.Second
+	DefaultLeaseDuration = 30 * time.Second
+	MaxRecoveryBackoff   = 30 * time.Second
 )
-
-var ErrNoJobsToAcquire = errors.New("no jobs to acquire")
 
 // RDB represents the Redis-backed broker implementation for managing job queues.
 // It wraps a Redis client to interact with the underlying database.
@@ -163,13 +167,13 @@ func (rdb *RDB) Acquire(ctx context.Context) (*shared.Job, string, error) {
 	}
 
 	now := time.Now().Unix()
-	res, err := acquisitionScript.Run(ctx, rdb.client, []string{ReadyQueue, ProcessingQueue}, now, DefaultJobTimeout.Seconds(), leaseID).Result()
+	res, err := acquisitionScript.Run(ctx, rdb.client, []string{ReadyQueue, ProcessingQueue}, now, DefaultLeaseDuration.Seconds(), leaseID).Result()
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to fetch job : %w", err)
 	}
 
 	if res == nil {
-		return nil, "", ErrNoJobsToAcquire
+		return nil, "", ErrNoJobsToAcquire{Code: 500, Message: "no jobs to acquire"}
 	}
 
 	jobKey := res.(string)
@@ -177,7 +181,6 @@ func (rdb *RDB) Acquire(ctx context.Context) (*shared.Job, string, error) {
 	type JobScan struct {
 		shared.Job
 		Payload string `redis:"payload"`
-		JobID   string `redis:"job_id"`
 	}
 	var js JobScan
 	err = rdb.client.HGetAll(ctx, jobKey).Scan(&js)
@@ -186,7 +189,6 @@ func (rdb *RDB) Acquire(ctx context.Context) (*shared.Job, string, error) {
 	}
 
 	job := js.Job
-	job.JobID = js.JobID
 	if js.Payload != "" {
 		var p any
 		if err := json.Unmarshal([]byte(js.Payload), &p); err == nil {
@@ -208,13 +210,44 @@ var completionScript = redis.NewScript(`
 
 	redis.call('ZREM', KEYS[2], KEYS[1])
 	redis.call('DEL', KEYS[1])
-	return 1
+	return {}
 `)
 
 func (rdb *RDB) MarksAsCompleted(ctx context.Context, jobID, leaseID string) error {
 	err := completionScript.Run(ctx, rdb.client, []string{generateJobKey(jobID), ProcessingQueue}, leaseID).Err()
 	if err != nil {
 		return fmt.Errorf("failed to mark job succeed: %w", err)
+	}
+	return nil
+}
+
+var failureScript = redis.NewScript(`
+	local currentLease = redis.call('HGET', KEYS[2], 'lease_id')
+	if currentLease ~= ARGV[2] then
+		error('lease expired')
+	end
+
+	-- Add to failed_queue
+	redis.call('ZADD', KEYS[1], ARGV[1], KEYS[2])
+
+	-- Remove from processing_queue
+	redis.call('ZREM', KEYS[3], KEYS[2])
+
+	-- Update status to Failed
+	redis.call('HSET', KEYS[2], 'status', 'Failed')
+
+	-- Clear lease
+	redis.call('HDEL', KEYS[2], 'lease-id')
+
+	return {}
+`)
+
+func (rdb *RDB) MarkAsFailed(ctx context.Context, jobID, leaseID string) error {
+	failedAt := time.Now().Unix()
+
+	err := failureScript.Run(ctx, rdb.client, []string{FailedQueue, generateJobKey(jobID), ProcessingQueue}, failedAt, leaseID).Err()
+	if err != nil {
+		return fmt.Errorf("failed to mark job failed: %w", err)
 	}
 	return nil
 }
@@ -259,10 +292,10 @@ var resubmissionScript = redis.NewScript(`
 	return {}
 `)
 
-func (rdb *RDB) ResubmitJob(ctx context.Context, jobID string, nextRunAfter time.Duration, job *shared.Job) error {
+func (rdb *RDB) ResubmitJob(ctx context.Context, nextRunAfter time.Duration, job *shared.Job) error {
 	now := time.Now().Unix()
 	nextRunAt := now + int64(nextRunAfter.Seconds())
-	jobKey := generateJobKey(jobID)
+	jobKey := generateJobKey(job.JobID)
 
 	err := resubmissionScript.Run(ctx, rdb.client, []string{ProcessingQueue, MainQueue, jobKey}, nextRunAt,
 		"status", "Retrying",
@@ -283,15 +316,21 @@ var transferScript = redis.NewScript(`
 		redis.call('LPUSH', KEYS[2], unpack(jobs))
 		return jobs
 	end
-	return {}
+	return #jobs
 `)
 
 func (rdb *RDB) PollReadyJobs(ctx context.Context, batchSize int) error {
 	now := time.Now().Unix()
-	err := transferScript.Run(ctx, rdb.client, []string{MainQueue, ReadyQueue}, now, batchSize).Err()
+	res, err := transferScript.Run(ctx, rdb.client, []string{MainQueue, ReadyQueue}, now, batchSize).Result()
 	if err != nil && err.Error() != "redis: nil" {
 		return fmt.Errorf("failed to poll jobs : %w", err)
 	}
+
+	cnt := res.(int)
+	if cnt == 0 {
+		return ErrNoJobsToPoll{Code: 500, Message: "no jobs ready for execution"}
+	}
+
 	return nil
 }
 
@@ -335,4 +374,22 @@ func generateLeaseID() (string, error) {
 		return "", err
 	}
 	return b.String(), nil
+}
+
+type ErrNoJobsToAcquire struct {
+	Code    int
+	Message string
+}
+
+func (e ErrNoJobsToAcquire) Error() string {
+	return fmt.Sprintf("error %d: %s", e.Code, e.Message)
+}
+
+type ErrNoJobsToPoll struct {
+	Code    int
+	Message string
+}
+
+func (e ErrNoJobsToPoll) Error() string {
+	return fmt.Sprintf("error %d: %s", e.Code, e.Message)
 }
