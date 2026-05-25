@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log"
@@ -13,6 +14,7 @@ import (
 	"github.com/Yash840/runrq/internal/rdb"
 	"github.com/Yash840/runrq/internal/repository"
 	"github.com/Yash840/runrq/internal/shared"
+	"github.com/redis/go-redis/v9"
 )
 
 const (
@@ -29,11 +31,15 @@ const (
 )
 
 type Dispatcher struct {
+	concurrency int
+
 	log     *log.Logger
 	broker  shared.Broker
-	repo    repository.ResultRepository
+	repo    *repository.ResultRepository
 	baseCtx context.Context
-	quit    <-chan struct{}
+	quit    chan struct{}
+
+	wg *sync.WaitGroup
 
 	registry *JobRegistry
 
@@ -42,15 +48,57 @@ type Dispatcher struct {
 	resBackup sync.Map
 }
 
-func (d *Dispatcher) Start() {
+func NewDispatcher(concurrency int, db *sql.DB, rc *redis.Client) *Dispatcher {
+	logger := log.Logger{}
+	logger.SetPrefix("RUNRQ: ")
 
+	reg := NewDefaultJobRegistry()
+
+	repo := repository.NewResultRepository(db)
+	broker := rdb.NewRDB(rc)
+
+	return &Dispatcher{
+		concurrency: concurrency,
+		log:         &logger,
+		broker:      broker,
+		repo:        repo,
+		registry:    reg,
+
+		baseCtx:       context.Background(),
+		wg:            &sync.WaitGroup{},
+		cancellations: sync.Map{},
+		resBackup:     sync.Map{},
+
+		quit: make(chan struct{}, 1),
+	}
+}
+
+func (d *Dispatcher) Start() {
+	d.log.Println("dispatcher: starting... ")
+
+	go d.startScheduling()
+	go d.startRecovery()
+
+	for range d.concurrency {
+		d.wg.Add(1)
+		go d.exec()
+	}
+
+	d.log.Printf("dispatcher: started with concurrency: %d", d.concurrency)
 }
 
 func (d *Dispatcher) Shutdown() {
+	d.log.Println("dispatcher: Graceful Shutdown initiated")
 
+	close(d.quit)
+	d.wg.Wait()
+
+	d.log.Printf("dispatcher: Graceful Shutdown")
 }
 
 func (d *Dispatcher) exec() {
+	defer d.wg.Done()
+
 	workerID, err := generateWorkerID()
 	if err != nil {
 		d.log.Printf("error in generating workerID: %s\n", err)
@@ -89,11 +137,10 @@ func (d *Dispatcher) exec() {
 
 			deadline := time.Now().Add(time.Duration(job.MaxTimeout) * time.Second)
 			ctx, cancel := context.WithDeadline(context.Background(), deadline)
-			defer cancel()
 
 			d.cancellations.Store(job.JobID, cancel)
 
-			err = d.handleJob(ctx, job, lease)
+			err = d.handleJob(ctx, cancel, job, lease)
 			if err != nil {
 				d.log.Printf("worker #%s: error in handling job #%s: %v\n", workerID, job.JobID, err)
 			}
@@ -137,11 +184,16 @@ func (d *Dispatcher) startRecovery() {
 	}
 }
 
-func (d *Dispatcher) handleJob(ctx context.Context, job *shared.Job, lease string) error {
+func (d *Dispatcher) handleJob(ctx context.Context, cancel context.CancelFunc, job *shared.Job, lease string) error {
+	defer cancel()
+	defer d.cancellations.Delete(job.JobID)
+
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
+		go d.heartbeat(ctx, job.JobID, lease)
+
 		processor, err := d.registry.GetProc(job.JobType)
 		if err != nil {
 			return err
@@ -155,7 +207,7 @@ func (d *Dispatcher) handleJob(ctx context.Context, job *shared.Job, lease strin
 			d.log.Printf("job #%s execution failed\n", job.JobID)
 
 			// Handling not eligible jobs to retry
-			if job.RetryPolicy == shared.RetryPolicyNone || job.RetriesDone == job.MaxRetries {
+			if job.RetryPolicy == shared.RetryPolicyNone || job.RetriesDone >= job.MaxRetries {
 				d.log.Printf("job #%s not eligible for retry it is marked as failed\n", job.JobID)
 
 				err = d.broker.MarkAsFailed(ctx, job.JobID, lease)
@@ -163,15 +215,20 @@ func (d *Dispatcher) handleJob(ctx context.Context, job *shared.Job, lease strin
 					d.log.Printf("job #%s failed to mark as failed\n", job.JobID)
 					return err
 				}
+
+				return nil
 			}
 
 			// Handling eligible jobs to retry
 			nextRunAfter := calculateBackoff(job.RetryPolicy, job.RetriesDone)
+			job.RetriesDone++
 			err = d.broker.ResubmitJob(ctx, nextRunAfter, job)
 			if err != nil {
 				d.log.Printf("job #%s failed to resubmit for retry\n", job.JobID)
 				return err
 			}
+
+			return nil
 		}
 
 		// Completion Pipeline
@@ -198,6 +255,24 @@ func (d *Dispatcher) handleJob(ctx context.Context, job *shared.Job, lease strin
 		d.log.Printf("job #%s completed\n", job.JobID)
 
 		return nil
+	}
+}
+
+func (d *Dispatcher) heartbeat(ctx context.Context, jobID, lease string) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			err := d.broker.ExtendDeadline(ctx, jobID, lease, 15*time.Second)
+			if err != nil {
+				d.log.Printf("job #%s: heartbeat failed: %v", jobID, err)
+			}
+		}
+
 	}
 }
 

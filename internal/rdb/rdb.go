@@ -237,7 +237,7 @@ var failureScript = redis.NewScript(`
 	redis.call('HSET', KEYS[2], 'status', 'Failed')
 
 	-- Clear lease
-	redis.call('HDEL', KEYS[2], 'lease-id')
+	redis.call('HDEL', KEYS[2], 'lease_id')
 
 	return {}
 `)
@@ -252,8 +252,14 @@ func (rdb *RDB) MarkAsFailed(ctx context.Context, jobID, leaseID string) error {
 	return nil
 }
 
+var cancellationScript = redis.NewScript(`
+	redis.call('ZREM', KEYS[1], KEYS[2])
+	redis.call('DEL', KEYS[2])
+	return {}
+`)
+
 func (rdb *RDB) RemoveCancelled(ctx context.Context, jobID string) error {
-	err := rdb.client.Del(ctx, generateJobKey(jobID)).Err()
+	err := cancellationScript.Run(ctx, rdb.client, []string{ProcessingQueue, generateJobKey(jobID)})
 	if err != nil {
 		return fmt.Errorf("failed to remove cancelled job: %w", err)
 	}
@@ -269,12 +275,15 @@ var leaseExtensionScript = redis.NewScript(`
 		error("invalid lease")
 	end
 
-	redis.call('ZINCRBY', KEYS[2], ARGV[2], KEYS[1])
+	redis.call('ZADD', KEYS[2], ARGV[2], KEYS[1])
 	return {}
 `)
 
 func (rdb *RDB) ExtendDeadline(ctx context.Context, jobID, leaseID string, extension time.Duration) error {
-	err := leaseExtensionScript.Run(ctx, rdb.client, []string{generateJobKey(jobID), ProcessingQueue}, leaseID, extension.Seconds()).Err()
+	now := time.Now().Unix()
+	newDeadline := now + int64(extension.Seconds())
+
+	err := leaseExtensionScript.Run(ctx, rdb.client, []string{generateJobKey(jobID), ProcessingQueue}, leaseID, newDeadline).Err()
 	if err != nil {
 		return fmt.Errorf("failed to extend deadline: %w", err)
 	}
@@ -314,7 +323,6 @@ var transferScript = redis.NewScript(`
 	if #jobs > 0 then 
 		redis.call('ZREM', KEYS[1], unpack(jobs))
 		redis.call('LPUSH', KEYS[2], unpack(jobs))
-		return jobs
 	end
 	return #jobs
 `)
@@ -326,7 +334,7 @@ func (rdb *RDB) PollReadyJobs(ctx context.Context, batchSize int) error {
 		return fmt.Errorf("failed to poll jobs : %w", err)
 	}
 
-	cnt := res.(int)
+	cnt := res.(int64)
 	if cnt == 0 {
 		return ErrNoJobsToPoll{Code: 500, Message: "no jobs ready for execution"}
 	}

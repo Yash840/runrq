@@ -27,7 +27,7 @@ func (j *JobRegistry) SetProc(t string, p JobProcessor) {
 	j.mp.Store(t, p)
 }
 
-func GetDefaultJobRegistry() *JobRegistry {
+func NewDefaultJobRegistry() *JobRegistry {
 	var registry = JobRegistry{mp: sync.Map{}}
 
 	registry.SetProc("send_email", &SendEmailProcessor{})

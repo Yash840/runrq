@@ -373,7 +373,7 @@ func TestRDB_ResubmitJob(t *testing.T) {
 	mr.HSet(jobKey, "status", "Processing", "lease_id", "some-lease-id")
 
 	nextRunAfter := 5 * time.Minute
-	err = rdb.ResubmitJob(ctx, jobID, nextRunAfter, &shared.Job{
+	err = rdb.ResubmitJob(ctx, nextRunAfter, &shared.Job{
 		JobID:       jobID,
 		RetriesDone: 1,
 		NextRunAt:   time.Unix(now+int64(nextRunAfter.Seconds()), 0),
