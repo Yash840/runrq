@@ -14,6 +14,10 @@ type Config struct {
 	DBPassword string
 	DBName     string
 	DBSSLMode  string
+
+	RAddr     string
+	RPassword string
+	RDB       string
 }
 
 func LoadConfig() *Config {
@@ -30,6 +34,9 @@ func LoadConfig() *Config {
 		DBPassword: getEnv("DB_PASSWORD", ""),
 		DBName:     getEnv("DB_NAME", "runrq_db"),
 		DBSSLMode:  getEnv("DB_SSLMODE", "disable"),
+		RAddr:      getEnv("REDIS_ADDR", "localhost:6379"),
+		RPassword:  getEnv("REDIS_PASSWORD", ""),
+		RDB:        getEnv("REDIS_DATABASE", "0"),
 	}
 }
 

@@ -1,9 +1,7 @@
 package engine
 
 import (
-	"errors"
 	"fmt"
-	"math/rand"
 	"sync"
 	"time"
 
@@ -39,14 +37,6 @@ type SendEmailProcessor struct{}
 
 func (s *SendEmailProcessor) Process(job *shared.Job) (any, error) {
 	time.Sleep(5 * time.Second)
-	n := rand.Intn(1)
-
-	switch n {
-	case 0:
-		return nil, errors.New("send email failed")
-	case 1:
-		return "Done", nil
-	}
 
 	return nil, nil
 }

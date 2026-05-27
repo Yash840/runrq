@@ -32,27 +32,27 @@ type Job struct {
 }
 
 type JobOpts struct {
-	ownerID      string
-	payload      any
-	jobType      string
-	status       JobStatus
-	scheduleTime time.Time
-	RetryPolicy  RetryPolicy
-	maxRetries   int
-	StoreResult  bool
-	MaxTimeout   int
+	OwnerID      string      `json:"owner_id"`
+	Payload      any         `json:"payload"`
+	JobType      string      `json:"job_type"`
+	Status       JobStatus   `json:"status"`
+	ScheduleTime time.Time   `json:"schedule_time"`
+	RetryPolicy  RetryPolicy `json:"retry_policy"`
+	MaxRetries   int         `json:"max_retries"`
+	StoreResult  bool        `json:"store_result"`
+	MaxTimeout   int         `json:"max_timeout"`
 }
 
 func NewJob(opts JobOpts) (Job, error) {
-	if opts.ownerID == "" {
+	if opts.OwnerID == "" {
 		return Job{}, errors.New("ownerID is required")
 	}
 
-	if opts.scheduleTime.IsZero() {
-		opts.scheduleTime = time.Now()
+	if opts.ScheduleTime.IsZero() {
+		opts.ScheduleTime = time.Now()
 	}
 
-	if opts.maxRetries < 0 {
+	if opts.MaxRetries < 0 {
 		return Job{}, errors.New("maxRetries cannot be negative")
 	}
 
@@ -63,14 +63,14 @@ func NewJob(opts JobOpts) (Job, error) {
 
 	return Job{
 		JobID:        jobID,
-		OwnerID:      opts.ownerID,
-		Payload:      opts.payload,
-		JobType:      opts.jobType,
+		OwnerID:      opts.OwnerID,
+		Payload:      opts.Payload,
+		JobType:      opts.JobType,
 		Status:       JobStatusQueued,
-		ScheduleTime: opts.scheduleTime,
-		NextRunAt:    opts.scheduleTime,
+		ScheduleTime: opts.ScheduleTime,
+		NextRunAt:    opts.ScheduleTime,
 		RetryPolicy:  opts.RetryPolicy,
-		MaxRetries:   opts.maxRetries,
+		MaxRetries:   opts.MaxRetries,
 		RetriesDone:  0,
 		StoreResult:  opts.StoreResult,
 		MaxTimeout:   opts.MaxTimeout,
@@ -194,6 +194,26 @@ func (r RetryPolicy) String() string {
 
 func (r RetryPolicy) MarshalBinary() ([]byte, error) {
 	return []byte(r.String()), nil
+}
+
+func (r *RetryPolicy) UnmarshalJSON(data []byte) error {
+	var str string
+	if err := json.Unmarshal(data, &str); err != nil {
+		return err
+	}
+	switch str {
+	case "Immediate":
+		*r = RetryPolicyImmediate
+	case "Moderate":
+		*r = RetryPolicyModerate
+	case "Delayed":
+		*r = RetryPolicyDelayed
+	case "None":
+		*r = RetryPolicyNone
+	default:
+		return errors.New("invalid RetryPolicy")
+	}
+	return nil
 }
 
 func (r *RetryPolicy) UnmarshalBinary(data []byte) error {

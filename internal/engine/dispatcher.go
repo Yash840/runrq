@@ -43,14 +43,13 @@ type Dispatcher struct {
 
 	registry *JobRegistry
 
-	cancellations sync.Map
+	cancellations *sync.Map
 
-	resBackup sync.Map
+	resBackup *sync.Map
 }
 
-func NewDispatcher(concurrency int, db *sql.DB, rc *redis.Client) *Dispatcher {
-	logger := log.Logger{}
-	logger.SetPrefix("RUNRQ: ")
+func NewDispatcher(concurrency int, db *sql.DB, rc *redis.Client, c *sync.Map) *Dispatcher {
+	logger := log.New(os.Stdout, "RUNRQ: ", log.LstdFlags)
 
 	reg := NewDefaultJobRegistry()
 
@@ -59,15 +58,15 @@ func NewDispatcher(concurrency int, db *sql.DB, rc *redis.Client) *Dispatcher {
 
 	return &Dispatcher{
 		concurrency: concurrency,
-		log:         &logger,
+		log:         logger,
 		broker:      broker,
 		repo:        repo,
 		registry:    reg,
 
 		baseCtx:       context.Background(),
 		wg:            &sync.WaitGroup{},
-		cancellations: sync.Map{},
-		resBackup:     sync.Map{},
+		cancellations: c,
+		resBackup:     &sync.Map{},
 
 		quit: make(chan struct{}, 1),
 	}
@@ -272,7 +271,6 @@ func (d *Dispatcher) heartbeat(ctx context.Context, jobID, lease string) {
 				d.log.Printf("job #%s: heartbeat failed: %v", jobID, err)
 			}
 		}
-
 	}
 }
 
@@ -282,14 +280,14 @@ func generateWorkerID() (string, error) {
 		return "", nil
 	}
 	pid := os.Getpid()
-	instant := time.Now().UnixMilli()
+	instant := time.Now().Nanosecond()
 
 	return fmt.Sprintf("%s:%d:%d", hostName, pid, instant), nil
 }
 
 func calculateBackoff(policy shared.RetryPolicy, retry int) time.Duration {
 	var baseDelay int
-	var maxBackoff int
+	var maxBackoff int64
 
 	switch policy {
 	case shared.RetryPolicyImmediate:
@@ -303,7 +301,7 @@ func calculateBackoff(policy shared.RetryPolicy, retry int) time.Duration {
 		maxBackoff = DelayedMaxBackoff
 	}
 
-	backoff := baseDelay + (1 << retry)
+	backoff := int64(baseDelay + (1 << retry))
 
 	if backoff > maxBackoff {
 		backoff = maxBackoff

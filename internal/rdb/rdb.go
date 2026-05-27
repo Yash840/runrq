@@ -150,7 +150,7 @@ func (rdb *RDB) IsCancelled(ctx context.Context, jobID string) (bool, error) {
 // ARGV[1]: currentTime, ARGV[2]: timeout (seconds), ARGV[3]: leaseID
 var acquisitionScript = redis.NewScript(`
 	local jobKey = redis.call('RPOP', KEYS[1])
-	if jobKey == nil then
+	if jobKey == false then
 		return nil
 	end
 
@@ -167,7 +167,13 @@ func (rdb *RDB) Acquire(ctx context.Context) (*shared.Job, string, error) {
 	}
 
 	now := time.Now().Unix()
-	res, err := acquisitionScript.Run(ctx, rdb.client, []string{ReadyQueue, ProcessingQueue}, now, DefaultLeaseDuration.Seconds(), leaseID).Result()
+	res, err := acquisitionScript.Run(ctx, rdb.client,
+		[]string{ReadyQueue, ProcessingQueue},
+		now,
+		int64(DefaultLeaseDuration.Seconds()),
+		leaseID,
+	).Result()
+
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to fetch job : %w", err)
 	}
@@ -179,16 +185,41 @@ func (rdb *RDB) Acquire(ctx context.Context) (*shared.Job, string, error) {
 	jobKey := res.(string)
 
 	type JobScan struct {
-		shared.Job
-		Payload string `redis:"payload"`
+		JobID        string             `redis:"job_id"`
+		OwnerID      string             `redis:"owner_id"`
+		JobType      string             `redis:"job_type"`
+		Payload      string             `redis:"payload"`
+		Status       shared.JobStatus   `redis:"status"`
+		ScheduleTime time.Time          `redis:"schedule_time"`
+		NextRunAt    time.Time          `redis:"next_run_at"`
+		RetryPolicy  shared.RetryPolicy `redis:"retry_policy"`
+		MaxRetries   int                `redis:"max_retries"`
+		RetriesDone  int                `redis:"retries_done"`
+		StoreResult  bool               `redis:"store_result"`
+		MaxTimeout   int                `redis:"max_timeout"`
 	}
+
 	var js JobScan
 	err = rdb.client.HGetAll(ctx, jobKey).Scan(&js)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to scan job: %w", err)
 	}
 
-	job := js.Job
+	// Map the flat scanned struct to your actual domain Job
+	job := shared.Job{
+		JobID:        js.JobID,
+		OwnerID:      js.OwnerID,
+		JobType:      js.JobType,
+		Status:       js.Status,
+		ScheduleTime: js.ScheduleTime,
+		NextRunAt:    js.NextRunAt,
+		RetryPolicy:  js.RetryPolicy,
+		MaxRetries:   js.MaxRetries,
+		RetriesDone:  js.RetriesDone,
+		StoreResult:  js.StoreResult,
+		MaxTimeout:   js.MaxTimeout,
+	}
+
 	if js.Payload != "" {
 		var p any
 		if err := json.Unmarshal([]byte(js.Payload), &p); err == nil {
@@ -320,10 +351,12 @@ func (rdb *RDB) ResubmitJob(ctx context.Context, nextRunAfter time.Duration, job
 // transferScript atomically moves ready jobs from main_queue to ready_queue.
 var transferScript = redis.NewScript(`
 	local jobs = redis.call('ZRANGE', KEYS[1], '-inf', ARGV[1], 'BYSCORE', 'LIMIT', 0, ARGV[2])
-	if #jobs > 0 then 
-		redis.call('ZREM', KEYS[1], unpack(jobs))
-		redis.call('LPUSH', KEYS[2], unpack(jobs))
+	if jobs == false or #jobs == 0 then 
+		return 0
 	end
+	
+	redis.call('ZREM', KEYS[1], unpack(jobs))
+	redis.call('LPUSH', KEYS[2], unpack(jobs))
 	return #jobs
 `)
 
@@ -345,20 +378,22 @@ func (rdb *RDB) PollReadyJobs(ctx context.Context, batchSize int) error {
 // recoverScript atomically requeues abandoned jobs back into main_queue with random backoff.
 var recoverScript = redis.NewScript(`
 	local jobs = redis.call('ZRANGE', KEYS[1], '-inf', ARGV[1], 'BYSCORE', 'LIMIT', 0, ARGV[2])
-	if #jobs > 0 then
-		for i, jobKey in ipairs(jobs) do
-			local jobStatus = redis.call('HGET', jobKey, 'status')
-			local newScore = ARGV[1] + math.random(ARGV[3])
-			redis.call('ZREM', KEYS[1], jobKey)
-			redis.call('HDEL', jobKey, 'lease_id')
+	if jobs == false or #jobs == 0 then
+		return {}
+	end
 
-			if jobStatus ~= 'Cancelled' then
-				redis.call('ZADD', KEYS[2], newScore, jobKey)
-				redis.call('HSET', jobKey, 'status', "Recovering")
-			else 
-				redis.call('DEL', jobKey)
-			end		
-		end
+	for i, jobKey in ipairs(jobs) do
+		local jobStatus = redis.call('HGET', jobKey, 'status')
+		local newScore = ARGV[1] + math.random(ARGV[3])
+		redis.call('ZREM', KEYS[1], jobKey)
+		redis.call('HDEL', jobKey, 'lease_id')
+
+		if jobStatus ~= 'Cancelled' then
+			redis.call('ZADD', KEYS[2], newScore, jobKey)
+			redis.call('HSET', jobKey, 'status', "Recovering")
+		else 
+			redis.call('DEL', jobKey)
+		end		
 	end
 	return {}
 `)
